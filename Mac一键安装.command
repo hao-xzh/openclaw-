@@ -74,6 +74,8 @@ MIN_DISK_MB=1024  # 最低 1GB 磁盘空间
 # 失败日志收集
 declare -a FAIL_LOG=()
 FAIL_CATEGORY=""
+LAST_CMD_OUTPUT=""
+LAST_CMD_EXIT=0
 
 # ─────────────────────────────────────────────
 # 工具函数
@@ -99,6 +101,89 @@ run_cmd() {
   fi
   log_debug "执行: $*"
   eval "$@"
+}
+
+supports_progress_ui() {
+  [[ -t 1 ]]
+}
+
+download_file_with_progress() {
+  local url="$1"
+  local output="$2"
+  local label="${3:-下载中}"
+
+  if $DRY_RUN; then
+    echo -e "  ${DIM}[DRY-RUN] 下载 $label: $url -> $output${NC}"
+    return 0
+  fi
+
+  log_info "${label}..."
+  if supports_progress_ui; then
+    curl --connect-timeout 30 --max-time 300 -fL# "$url" -o "$output"
+  else
+    curl --connect-timeout 30 --max-time 300 -fsSL "$url" -o "$output"
+  fi
+}
+
+run_cmd_with_progress() {
+  local label="$1"
+  local command="$2"
+  local log_file
+  log_file="$(mktemp)"
+
+  if $DRY_RUN; then
+    echo -e "  ${DIM}[DRY-RUN] $command${NC}"
+    LAST_CMD_OUTPUT=""
+    LAST_CMD_EXIT=0
+    rm -f "$log_file"
+    return 0
+  fi
+
+  log_info "${label}..."
+  log_debug "执行(带进度): $command"
+
+  bash -lc "$command" >"$log_file" 2>&1 &
+  local pid=$!
+  local spin='-\|/'
+  local i=0
+  local elapsed=0
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if supports_progress_ui; then
+      printf "\r  [%c] %s... %ss" "${spin:i++%${#spin}:1}" "$label" "$elapsed"
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  wait "$pid"
+  LAST_CMD_EXIT=$?
+  LAST_CMD_OUTPUT="$(cat "$log_file")"
+  rm -f "$log_file"
+
+  if supports_progress_ui; then
+    printf "\r%*s\r" 80 ""
+  fi
+
+  if [[ $LAST_CMD_EXIT -eq 0 ]]; then
+    log_ok "${label} 完成 (${elapsed}s)"
+    return 0
+  fi
+
+  log_fail "${label} 失败 (exit=$LAST_CMD_EXIT)"
+  return "$LAST_CMD_EXIT"
+}
+
+show_command_error_excerpt() {
+  local output="$1"
+  local excerpt
+  excerpt="$(printf '%s\n' "$output" | grep -Ei 'ERR!|error|warn|failed|denied|ENOENT|EACCES|ETIMEDOUT|ECONN|sharp|node-gyp|gyp ERR' | head -10 || true)"
+  if [[ -n "$excerpt" ]]; then
+    echo -e "  ${DIM}关键错误摘要:${NC}"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && echo -e "    ${DIM}${line}${NC}"
+    done <<< "$excerpt"
+  fi
 }
 
 # ─────────────────────────────────────────────
@@ -411,7 +496,7 @@ install_node_official_mac() {
   tmp_dir="$(mktemp -d)"
   trap "rm -rf '$tmp_dir'" RETURN
 
-  if run_cmd "curl --connect-timeout 30 --max-time 300 -fsSL '$pkg_url' -o '$tmp_dir/node.tar.gz'"; then
+  if download_file_with_progress "$pkg_url" "$tmp_dir/node.tar.gz" "下载 Node.js 官方包"; then
     run_cmd "tar -xzf '$tmp_dir/node.tar.gz' -C '$tmp_dir'"
     local node_dir
     node_dir=$(ls -d "$tmp_dir"/node-v* 2>/dev/null | head -1)
@@ -443,7 +528,7 @@ install_node_official_linux() {
   tmp_dir="$(mktemp -d)"
   trap "rm -rf '$tmp_dir'" RETURN
 
-  if run_cmd "curl --connect-timeout 30 --max-time 300 -fsSL '$pkg_url' -o '$tmp_dir/node.tar.xz'"; then
+  if download_file_with_progress "$pkg_url" "$tmp_dir/node.tar.xz" "下载 Node.js 官方包"; then
     run_cmd "tar -xJf '$tmp_dir/node.tar.xz' -C '$tmp_dir'"
     local node_dir
     node_dir=$(ls -d "$tmp_dir"/node-v* 2>/dev/null | head -1)
@@ -610,22 +695,232 @@ phase3_network() {
 # Phase 4: OpenClaw 安装 (多级降级)
 # ═════════════════════════════════════════════
 
+path_contains_dir() {
+  local dir="${1%/}"
+  [[ -n "$dir" ]] || return 1
+  case ":$PATH:" in
+    *":$dir:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+npm_global_prefix() {
+  local prefix
+  prefix="$(npm config get prefix 2>/dev/null || true)"
+  if [[ -z "$prefix" || "$prefix" == "undefined" || "$prefix" == "null" ]]; then
+    prefix="$(npm prefix -g 2>/dev/null || true)"
+  fi
+  [[ -n "$prefix" ]] && echo "$prefix"
+}
+
+npm_global_bin_dir() {
+  local prefix
+  prefix="$(npm_global_prefix)"
+  [[ -n "$prefix" ]] && echo "${prefix%/}/bin"
+}
+
+pnpm_global_bin_dir() {
+  if check_command pnpm; then
+    pnpm bin -g 2>/dev/null || true
+  fi
+}
+
+shell_rc_candidates() {
+  local candidates=()
+
+  if [[ "$SHELL" == *zsh* ]]; then
+    candidates+=("$HOME/.zshrc" "$HOME/.zprofile")
+  elif [[ "$SHELL" == *bash* ]]; then
+    candidates+=("$HOME/.bashrc" "$HOME/.bash_profile")
+  else
+    candidates+=("$HOME/.profile")
+  fi
+
+  candidates+=("$HOME/.profile")
+
+  printf '%s\n' "${candidates[@]}" | awk '!seen[$0]++'
+}
+
+preferred_shell_rc() {
+  if [[ "$SHELL" == *zsh* ]]; then
+    echo "$HOME/.zshrc"
+  elif [[ "$SHELL" == *bash* ]]; then
+    echo "$HOME/.bashrc"
+  else
+    echo "$HOME/.profile"
+  fi
+}
+
+persist_path_dir() {
+  local dir="${1%/}"
+  [[ -n "$dir" ]] || return 0
+
+  local line="export PATH=\"$dir:\$PATH\""
+  local updated=false
+  local rc
+
+  while IFS= read -r rc; do
+    [[ -n "$rc" ]] || continue
+    if [[ ! -f "$rc" ]]; then
+      touch "$rc" 2>/dev/null || continue
+    fi
+    if grep -Fqs "$dir" "$rc"; then
+      continue
+    fi
+    printf '\n%s\n' "$line" >> "$rc"
+    updated=true
+    log_info "已写入 PATH 到 $(basename "$rc"): $dir"
+  done < <(shell_rc_candidates)
+
+  if $updated; then
+    log_ok "环境变量已持久化，下次打开终端会自动生效"
+  fi
+}
+
+ensure_path_dir() {
+  local dir="${1%/}"
+  [[ -n "$dir" ]] || return 0
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir" 2>/dev/null || true
+  fi
+  if ! path_contains_dir "$dir"; then
+    export PATH="$dir:$PATH"
+    hash -r 2>/dev/null || true
+  fi
+  persist_path_dir "$dir"
+}
+
+ensure_npm_global_bin_on_path() {
+  local bin_dir
+  bin_dir="$(npm_global_bin_dir)"
+  [[ -n "$bin_dir" ]] && ensure_path_dir "$bin_dir"
+}
+
+ensure_pnpm_global_bin_on_path() {
+  local bin_dir
+  bin_dir="$(pnpm_global_bin_dir)"
+  [[ -n "$bin_dir" ]] && ensure_path_dir "$bin_dir"
+}
+
+repair_openclaw_bin_from_root() {
+  local package_root="$1"
+  local bin_dir="$2"
+  [[ -d "$package_root" && -n "$bin_dir" ]] || return 1
+
+  local entry=""
+  for candidate in "$package_root/dist/entry.js" "$package_root/dist/entry.mjs"; do
+    if [[ -f "$candidate" ]]; then
+      entry="$candidate"
+      break
+    fi
+  done
+
+  [[ -n "$entry" ]] || return 1
+
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/openclaw" <<EOF
+#!/usr/bin/env bash
+exec node "$entry" "\$@"
+EOF
+  chmod +x "$bin_dir/openclaw"
+  log_warn "已自动修复 openclaw 命令入口: $bin_dir/openclaw"
+  return 0
+}
+
+repair_openclaw_bin() {
+  local npm_root npm_bin pnpm_root pnpm_bin
+
+  if check_command npm; then
+    npm_root="$(npm root -g 2>/dev/null || true)"
+    npm_bin="$(npm_global_bin_dir)"
+    if [[ -n "$npm_root" && -d "$npm_root/openclaw" && -n "$npm_bin" ]]; then
+      repair_openclaw_bin_from_root "$npm_root/openclaw" "$npm_bin" && return 0
+    fi
+  fi
+
+  if check_command pnpm; then
+    pnpm_root="$(pnpm root -g 2>/dev/null || true)"
+    pnpm_bin="$(pnpm_global_bin_dir)"
+    if [[ -n "$pnpm_root" && -d "$pnpm_root/openclaw" && -n "$pnpm_bin" ]]; then
+      repair_openclaw_bin_from_root "$pnpm_root/openclaw" "$pnpm_bin" && return 0
+    fi
+  fi
+
+  return 1
+}
+
 # npm 权限自动修复
 fix_npm_permissions() {
   if ! check_command npm; then
     return 0
   fi
   local npm_prefix
-  npm_prefix="$(npm prefix -g 2>/dev/null)" || return 0
+  npm_prefix="$(npm_global_prefix)" || return 0
 
   if [[ ! -w "$npm_prefix" ]]; then
     log_warn "npm 全局目录无写权限: $npm_prefix"
     log_info "自动切换到用户目录: ~/.npm-global"
-    mkdir -p "$HOME/.npm-global"
+    mkdir -p "$HOME/.npm-global/bin"
     run_cmd "npm config set prefix '$HOME/.npm-global'"
-    export PATH="$HOME/.npm-global/bin:$PATH"
     log_ok "npm 权限已修复"
   fi
+
+  ensure_npm_global_bin_on_path
+}
+
+ensure_pnpm() {
+  if check_command pnpm; then
+    ensure_pnpm_global_bin_on_path
+    return 0
+  fi
+
+  if check_command corepack; then
+    log_info "尝试通过 Corepack 启用 pnpm..."
+    run_cmd "corepack enable" 2>/dev/null || true
+    run_cmd "corepack prepare pnpm@latest --activate" 2>/dev/null || \
+    run_cmd "corepack prepare pnpm@10 --activate" 2>/dev/null || true
+  fi
+
+  hash -r 2>/dev/null || true
+  if check_command pnpm; then
+    ensure_pnpm_global_bin_on_path
+    log_ok "pnpm 已就绪"
+    return 0
+  fi
+
+  log_info "尝试通过 npm 安装 pnpm..."
+  fix_npm_permissions
+  run_cmd "npm install -g pnpm@latest --registry=https://registry.npmmirror.com" 2>/dev/null || \
+  run_cmd "npm install -g pnpm@latest" || {
+    log_warn "pnpm 自动安装失败"
+    return 1
+  }
+
+  hash -r 2>/dev/null || true
+  if check_command pnpm; then
+    ensure_pnpm_global_bin_on_path
+    log_ok "pnpm 已安装"
+    return 0
+  fi
+
+  return 1
+}
+
+approve_pnpm_builds_if_supported() {
+  if ! check_command pnpm; then
+    return 0
+  fi
+
+  local help_output
+  help_output="$(pnpm approve-builds --help 2>/dev/null || true)"
+  if echo "$help_output" | grep -q -- '--all'; then
+    log_info "尝试自动批准 pnpm 全局构建脚本..."
+    run_cmd "pnpm approve-builds -g --all" 2>/dev/null || true
+    return 0
+  fi
+
+  log_warn "当前 pnpm 版本的 approve-builds 缺少无交互参数，已跳过以避免脚本卡住"
+  return 0
 }
 
 # 确保 Git 已安装
@@ -666,24 +961,29 @@ install_level1() {
 
   for attempt in 1 2 3; do
     log_debug "尝试 $attempt/3..."
-    local output
-    output=$(curl --connect-timeout 30 --max-time 300 \
-      -fsSL "https://openclaw.ai/install.sh" 2>&1) || {
+    local installer_file
+    installer_file="$(mktemp)"
+    if ! download_file_with_progress "https://openclaw.ai/install.sh" "$installer_file" "下载官方安装脚本"; then
       local exit_code=$?
-      log_debug "curl 失败 (exit=$exit_code): $output"
+      log_debug "curl 失败 (exit=$exit_code)"
+      rm -f "$installer_file"
       if [[ $attempt -lt 3 ]]; then
         log_debug "等待 5 秒后重试..."
         sleep 5
       fi
       continue
-    }
+    fi
 
     # 下载成功，执行安装脚本
-    if echo "$output" | bash -s -- --no-onboard 2>&1; then
+    local install_cmd="bash '$installer_file'"
+    [[ -n "$onboard_flag" ]] && install_cmd="$install_cmd $onboard_flag"
+    if run_cmd_with_progress "执行官方安装脚本" "$install_cmd"; then
+      rm -f "$installer_file"
       return 0
     else
-      local exit_code=$?
-      record_failure "Level1" "脚本执行失败" "exit_code=$exit_code"
+      record_failure "Level1" "脚本执行失败" "exit_code=$LAST_CMD_EXIT output=${LAST_CMD_OUTPUT:0:300}"
+      show_command_error_excerpt "$LAST_CMD_OUTPUT"
+      rm -f "$installer_file"
       break
     fi
   done
@@ -702,27 +1002,26 @@ install_level2() {
   fi
 
   fix_npm_permissions
-
   export SHARP_IGNORE_GLOBAL_LIBVIPS=1
+  ensure_npm_global_bin_on_path
 
-  local output
-  if output=$(run_cmd "npm install -g openclaw@latest \
+  if run_cmd_with_progress "npm 官方源安装 OpenClaw" "npm install -g openclaw@latest \
     --fetch-timeout=300000 \
     --fetch-retries=3 \
     --fetch-retry-mintimeout=20000 \
-    --fetch-retry-maxtimeout=120000" 2>&1); then
+    --fetch-retry-maxtimeout=120000"; then
     return 0
   else
-    local exit_code=$?
     # 分析失败原因
-    if echo "$output" | grep -qi "ETIMEDOUT\|ECONNREFUSED\|ENOTFOUND\|EAI_AGAIN\|fetch failed"; then
-      record_failure "Level2" "网络超时" "npmjs.org 连接失败: $output"
-    elif echo "$output" | grep -qi "EACCES\|permission denied"; then
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    if echo "$LAST_CMD_OUTPUT" | grep -qi "ETIMEDOUT\|ECONNREFUSED\|ENOTFOUND\|EAI_AGAIN\|fetch failed"; then
+      record_failure "Level2" "网络超时" "npmjs.org 连接失败: ${LAST_CMD_OUTPUT:0:300}"
+    elif echo "$LAST_CMD_OUTPUT" | grep -qi "EACCES\|permission denied"; then
       record_failure "Level2" "权限错误" "npm 全局安装权限不足 (自动修复失败)"
-    elif echo "$output" | grep -qi "gyp ERR\|node-gyp\|sharp"; then
-      record_failure "Level2" "编译错误" "原生模块编译失败: $output"
+    elif echo "$LAST_CMD_OUTPUT" | grep -qi "gyp ERR\|node-gyp\|sharp"; then
+      record_failure "Level2" "编译错误" "原生模块编译失败: ${LAST_CMD_OUTPUT:0:300}"
     else
-      record_failure "Level2" "npm 安装失败" "exit_code=$exit_code output=$output"
+      record_failure "Level2" "npm 安装失败" "exit_code=$LAST_CMD_EXIT output=${LAST_CMD_OUTPUT:0:300}"
     fi
     return 1
   fi
@@ -738,8 +1037,8 @@ install_level3() {
   fi
 
   fix_npm_permissions
-
   export SHARP_IGNORE_GLOBAL_LIBVIPS=1
+  ensure_npm_global_bin_on_path
 
   # 设置所有原生模块的国内二进制镜像（关键！）
   # 即使 registry 用了 npmmirror，原生模块默认仍从 GitHub 下载
@@ -757,41 +1056,108 @@ install_level3() {
 
   log_info "已设置原生模块国内二进制镜像"
 
-  local output
-  if output=$(run_cmd "npm install -g openclaw@latest \
+  if run_cmd_with_progress "npm 国内镜像安装 OpenClaw" "npm install -g openclaw@latest \
     --registry=https://registry.npmmirror.com \
     --fetch-timeout=300000 \
     --fetch-retries=3 \
-    --fetch-retry-mintimeout=20000" 2>&1); then
+    --fetch-retry-mintimeout=20000"; then
     return 0
   else
-    local exit_code=$?
-
-    # 显示 npm 实际错误
-    echo -e "  ${DIM}npm 错误输出:${NC}"
-    echo "$output" | grep -i 'ERR!\|error\|WARN' | head -10 | while read -r line; do
-      echo -e "    ${DIM}${line}${NC}"
-    done
-
-    if echo "$output" | grep -qi "ETIMEDOUT\|ECONNREFUSED\|ENOTFOUND\|EAI_AGAIN\|fetch failed\|network"; then
-      record_failure "Level3" "网络超时" "npmmirror.com 连接失败: ${output:0:200}"
-    elif echo "$output" | grep -qi "EACCES\|permission denied"; then
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    if echo "$LAST_CMD_OUTPUT" | grep -qi "ETIMEDOUT\|ECONNREFUSED\|ENOTFOUND\|EAI_AGAIN\|fetch failed\|network"; then
+      record_failure "Level3" "网络超时" "npmmirror.com 连接失败: ${LAST_CMD_OUTPUT:0:200}"
+    elif echo "$LAST_CMD_OUTPUT" | grep -qi "EACCES\|permission denied"; then
       record_failure "Level3" "权限错误" "npm 全局安装权限不足"
-    elif echo "$output" | grep -qi "gyp ERR\|node-gyp\|sharp"; then
+    elif echo "$LAST_CMD_OUTPUT" | grep -qi "gyp ERR\|node-gyp\|sharp"; then
       record_failure "Level3" "编译错误" "原生模块编译失败"
     else
-      record_failure "Level3" "npm 镜像安装失败" "exit_code=$exit_code output=${output:0:300}"
+      record_failure "Level3" "npm 镜像安装失败" "exit_code=$LAST_CMD_EXIT output=${LAST_CMD_OUTPUT:0:300}"
     fi
     return 1
   fi
 }
 
-# Level 4: GitHub 源码构建
 install_level4() {
-  log_info "⏳ Level 4: 官方 GitHub 源码构建..."
+  log_info "⏳ Level 4: pnpm 官方源安装..."
+
+  ensure_pnpm || {
+    record_failure "Level4" "pnpm 不可用" "pnpm / corepack 均不可用"
+    return 1
+  }
+
+  export SHARP_IGNORE_GLOBAL_LIBVIPS=1
+  ensure_pnpm_global_bin_on_path
+
+  if run_cmd_with_progress "pnpm 官方源安装 OpenClaw" "pnpm add -g openclaw@latest"; then
+    approve_pnpm_builds_if_supported
+    return 0
+  else
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    if echo "$LAST_CMD_OUTPUT" | grep -qi "ETIMEDOUT\|ECONNREFUSED\|ENOTFOUND\|EAI_AGAIN\|fetch failed\|network"; then
+      record_failure "Level4" "网络超时" "pnpm 官方源连接失败: ${LAST_CMD_OUTPUT:0:200}"
+    else
+      record_failure "Level4" "pnpm 安装失败" "exit_code=$LAST_CMD_EXIT output=${LAST_CMD_OUTPUT:0:300}"
+    fi
+    return 1
+  fi
+}
+
+install_level5() {
+  log_info "⏳ Level 5: pnpm 国内镜像安装..."
+
+  ensure_pnpm || {
+    record_failure "Level5" "pnpm 不可用" "pnpm / corepack 均不可用"
+    return 1
+  }
+
+  export SHARP_IGNORE_GLOBAL_LIBVIPS=1
+  ensure_pnpm_global_bin_on_path
+
+  if run_cmd_with_progress "pnpm 国内镜像安装 OpenClaw" "pnpm add -g openclaw@latest --registry=https://registry.npmmirror.com"; then
+    approve_pnpm_builds_if_supported
+    return 0
+  else
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    if echo "$LAST_CMD_OUTPUT" | grep -qi "ETIMEDOUT\|ECONNREFUSED\|ENOTFOUND\|EAI_AGAIN\|fetch failed\|network"; then
+      record_failure "Level5" "网络超时" "pnpm 国内镜像连接失败: ${LAST_CMD_OUTPUT:0:200}"
+    else
+      record_failure "Level5" "pnpm 镜像安装失败" "exit_code=$LAST_CMD_EXIT output=${LAST_CMD_OUTPUT:0:300}"
+    fi
+    return 1
+  fi
+}
+
+install_level6() {
+  log_info "⏳ Level 6: GitHub main 直装..."
+
+  if ! check_command npm; then
+    record_failure "Level6" "npm 不可用" "npm 命令不存在"
+    return 1
+  fi
+
+  fix_npm_permissions
+  export SHARP_IGNORE_GLOBAL_LIBVIPS=1
+  ensure_npm_global_bin_on_path
+
+  if run_cmd_with_progress "GitHub main 安装 OpenClaw" "npm install -g github:openclaw/openclaw#main \
+    --fetch-timeout=300000 \
+    --fetch-retries=3 \
+    --fetch-retry-mintimeout=20000 \
+    --fetch-retry-maxtimeout=120000"; then
+    return 0
+  else
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    record_failure "Level6" "GitHub main 安装失败" "exit_code=$LAST_CMD_EXIT output=${LAST_CMD_OUTPUT:0:300}"
+    return 1
+  fi
+}
+
+# Level 7: GitHub 源码构建
+install_level7() {
+  log_info "⏳ Level 7: 官方 GitHub 源码构建..."
 
   if ! check_command git; then
-    record_failure "Level4" "Git 不可用" "源码构建需要 Git，请先安装: brew install git / apt install git"
+    record_failure "Level7" "Git 不可用" "源码构建需要 Git，请先安装: brew install git / apt install git"
     return 1
   fi
 
@@ -800,13 +1166,15 @@ install_level4() {
   # 克隆或更新
   if [[ -d "$clone_dir/.git" ]]; then
     log_info "已有本地仓库，更新中..."
-    run_cmd "cd '$clone_dir' && git pull --ff-only" || {
-      record_failure "Level4" "Git pull 失败" "github.com 不可达"
+    run_cmd_with_progress "更新 OpenClaw 源码仓库" "cd '$clone_dir' && git pull --ff-only" || {
+      show_command_error_excerpt "$LAST_CMD_OUTPUT"
+      record_failure "Level7" "Git pull 失败" "github.com 不可达: ${LAST_CMD_OUTPUT:0:300}"
       return 1
     }
   else
-    run_cmd "git clone --depth 1 https://github.com/openclaw/openclaw.git '$clone_dir'" || {
-      record_failure "Level4" "Git clone 失败" "github.com 不可达"
+    run_cmd_with_progress "克隆 OpenClaw 源码仓库" "git clone --depth 1 https://github.com/openclaw/openclaw.git '$clone_dir'" || {
+      show_command_error_excerpt "$LAST_CMD_OUTPUT"
+      record_failure "Level7" "Git clone 失败" "github.com 不可达: ${LAST_CMD_OUTPUT:0:300}"
       return 1
     }
   fi
@@ -814,34 +1182,34 @@ install_level4() {
   cd "$clone_dir"
 
   # 确保 pnpm 可用
-  if ! check_command pnpm; then
-    log_info "安装 pnpm..."
-    run_cmd "npm install -g pnpm --registry=https://registry.npmmirror.com" 2>/dev/null || \
-    run_cmd "npm install -g pnpm" || {
-      record_failure "Level4" "pnpm 安装失败" "无法安装 pnpm"
-      return 1
-    }
-  fi
+  ensure_pnpm || {
+    record_failure "Level7" "pnpm 安装失败" "无法安装 pnpm"
+    return 1
+  }
 
   # 构建
   log_info "安装依赖..."
-  run_cmd "pnpm install --registry=https://registry.npmmirror.com" 2>/dev/null || \
-  run_cmd "pnpm install" || {
-    record_failure "Level4" "依赖安装失败" "pnpm install 出错"
+  run_cmd_with_progress "安装源码依赖" "cd '$clone_dir' && pnpm install --registry=https://registry.npmmirror.com" 2>/dev/null || \
+  run_cmd_with_progress "安装源码依赖" "cd '$clone_dir' && pnpm install" || {
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    record_failure "Level7" "依赖安装失败" "pnpm install 出错: ${LAST_CMD_OUTPUT:0:300}"
     return 1
   }
 
   log_info "构建中..."
-  run_cmd "pnpm ui:build && pnpm build" || {
-    record_failure "Level4" "构建失败" "pnpm build 出错"
+  run_cmd_with_progress "构建 OpenClaw" "cd '$clone_dir' && pnpm ui:build && pnpm build" || {
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    record_failure "Level7" "构建失败" "pnpm build 出错: ${LAST_CMD_OUTPUT:0:300}"
     return 1
   }
 
-  run_cmd "pnpm link --global" || {
-    record_failure "Level4" "全局链接失败" "pnpm link --global 出错"
+  run_cmd_with_progress "全局链接 OpenClaw" "cd '$clone_dir' && pnpm link --global" || {
+    show_command_error_excerpt "$LAST_CMD_OUTPUT"
+    record_failure "Level7" "全局链接失败" "pnpm link --global 出错: ${LAST_CMD_OUTPUT:0:300}"
     return 1
   }
 
+  ensure_pnpm_global_bin_on_path
   return 0
 }
 
@@ -867,12 +1235,15 @@ phase4_install() {
       fix_npm_permissions
       install_level2 && { log_ok "安装成功 (npm 官方源)"; return 0; }
       install_level3 && { log_ok "安装成功 (npm 国内镜像)"; return 0; }
+      install_level4 && { log_ok "安装成功 (pnpm 官方源)"; return 0; }
+      install_level5 && { log_ok "安装成功 (pnpm 国内镜像)"; return 0; }
+      install_level6 && { log_ok "安装成功 (GitHub main)"; return 0; }
       ;;
     git)
-      install_level4 && { log_ok "安装成功 (源码构建)"; return 0; }
+      install_level7 && { log_ok "安装成功 (源码构建)"; return 0; }
       ;;
     auto|*)
-      # 自动降级: Level 1 → 2 → 3 → 4
+      # 自动降级: Level 1 → 2 → 3 → 4 → 5 → 6 → 7
       install_level1 && { log_ok "安装成功 (官方脚本) ✅"; return 0; }
       log_warn "Level 1 失败，降级到 Level 2..."
 
@@ -882,7 +1253,16 @@ phase4_install() {
       install_level3 && { log_ok "安装成功 (npm 国内镜像) ✅"; return 0; }
       log_warn "Level 3 失败，降级到 Level 4..."
 
-      install_level4 && { log_ok "安装成功 (源码构建) ✅"; return 0; }
+      install_level4 && { log_ok "安装成功 (pnpm 官方源) ✅"; return 0; }
+      log_warn "Level 4 失败，降级到 Level 5..."
+
+      install_level5 && { log_ok "安装成功 (pnpm 国内镜像) ✅"; return 0; }
+      log_warn "Level 5 失败，降级到 Level 6..."
+
+      install_level6 && { log_ok "安装成功 (GitHub main) ✅"; return 0; }
+      log_warn "Level 6 失败，降级到 Level 7..."
+
+      install_level7 && { log_ok "安装成功 (源码构建) ✅"; return 0; }
       ;;
   esac
 
@@ -903,20 +1283,76 @@ show_failure_report() {
   echo -e "${NC}"
 
   # 分析失败原因分类
-  local has_network=false has_permission=false has_compile=false has_other=false
+  local has_network=false has_permission=false has_compile=false has_path=false has_pnpm_approve=false has_git=false has_other=false
   for entry in "${FAIL_LOG[@]}"; do
     local reason
+    local detail
     reason=$(echo "$entry" | cut -d'|' -f2)
+    detail=$(echo "$entry" | cut -d'|' -f3)
     case "$reason" in
       *网络*|*超时*|*不可达*|*clone*|*pull*) has_network=true ;;
       *权限*) has_permission=true ;;
       *编译*) has_compile=true ;;
       *) has_other=true ;;
     esac
+    [[ "$reason" == *PATH* || "$detail" == *PATH* || "$detail" == *命令不可用* ]] && has_path=true
+    [[ "$reason" == *Git* || "$detail" == *github.com* ]] && has_git=true
+    [[ "$reason" == *pnpm* || "$detail" == *approve-builds* || "$detail" == *"build scripts"* ]] && has_pnpm_approve=true
   done
 
   # 输出主要失败原因
-  if $has_network; then
+  if $has_path; then
+    FAIL_CATEGORY="PATH"
+    local shell_rc
+    shell_rc="$(preferred_shell_rc)"
+    echo -e "  ${BOLD}失败原因: 🧭 PATH 尚未在当前终端生效${NC}"
+    echo ""
+    echo -e "  ${BOLD}解决方案:${NC}"
+    echo -e "  1. 先在当前终端执行:"
+    echo -e "     ${CYAN}source ${shell_rc}${NC}"
+    echo -e "  2. 然后立刻验证:"
+    echo -e "     ${CYAN}openclaw --version${NC}"
+    echo -e "  3. 如果还不行，重新打开一个新的终端窗口再试"
+  elif $has_permission; then
+    FAIL_CATEGORY="权限"
+    echo -e "  ${BOLD}失败原因: 🔒 npm 权限不足${NC}"
+    echo ""
+    echo -e "  ${BOLD}脚本已尝试自动修复到用户目录，如果仍失败，请手动执行:${NC}"
+    echo -e "     ${CYAN}mkdir -p ~/.npm-global/bin${NC}"
+    echo -e "     ${CYAN}npm config set prefix ~/.npm-global${NC}"
+    echo -e "     ${CYAN}source $(preferred_shell_rc)${NC}"
+    echo -e "  然后重新运行本脚本。"
+  elif $has_compile; then
+    FAIL_CATEGORY="编译"
+    echo -e "  ${BOLD}失败原因: 🔨 sharp / 原生模块编译失败${NC}"
+    echo ""
+    echo -e "  ${BOLD}解决方案:${NC}"
+    if [[ "$(detect_os)" == "macOS" ]]; then
+      echo -e "  1. 安装 Xcode Command Line Tools:"
+      echo -e "     ${CYAN}xcode-select --install${NC}"
+    else
+      echo -e "  1. 安装编译工具链:"
+      echo -e "     ${CYAN}sudo apt install -y build-essential python3${NC}"
+    fi
+    echo -e "  2. 然后重新运行本脚本，脚本会继续带上 ${CYAN}SHARP_IGNORE_GLOBAL_LIBVIPS=1${NC}"
+  elif $has_pnpm_approve; then
+    FAIL_CATEGORY="pnpm-approve"
+    echo -e "  ${BOLD}失败原因: 📦 pnpm 需要批准构建脚本${NC}"
+    echo ""
+    echo -e "  ${BOLD}解决方案:${NC}"
+    echo -e "  1. 执行:"
+    echo -e "     ${CYAN}pnpm approve-builds -g${NC}"
+    echo -e "  2. 批准 OpenClaw 相关依赖后，再重新运行本脚本"
+  elif $has_git && $has_network; then
+    FAIL_CATEGORY="Git"
+    echo -e "  ${BOLD}失败原因: 🧬 GitHub 不可达 / Git 拉取失败${NC}"
+    echo ""
+    echo -e "  ${BOLD}解决方案:${NC}"
+    echo -e "  1. 开启代理后重试:"
+    echo -e "     ${CYAN}bash Mac一键安装.command --proxy http://127.0.0.1:7890${NC}"
+    echo -e "  2. 或让脚本直接走 npm / pnpm 路径:"
+    echo -e "     ${CYAN}bash Mac一键安装.command --install-method npm${NC}"
+  elif $has_network; then
     FAIL_CATEGORY="网络"
     echo -e "  ${BOLD}失败原因: 🌐 网络连接问题${NC}"
     echo ""
@@ -930,29 +1366,6 @@ show_failure_report() {
     echo -e "  3. 或手动指定代理:"
     echo -e "     ${CYAN}bash Mac一键安装.command --proxy http://your-proxy:port${NC}"
     echo -e "  4. 手动安装: ${CYAN}https://docs.openclaw.ai/install${NC}"
-  elif $has_permission; then
-    FAIL_CATEGORY="权限"
-    echo -e "  ${BOLD}失败原因: 🔒 权限不足${NC}"
-    echo ""
-    echo -e "  ${BOLD}解决方案:${NC}"
-    echo -e "  1. 手动修复 npm 权限:"
-    echo -e "     ${CYAN}mkdir -p ~/.npm-global${NC}"
-    echo -e "     ${CYAN}npm config set prefix ~/.npm-global${NC}"
-    echo -e "     ${CYAN}export PATH=~/.npm-global/bin:\$PATH${NC}"
-    echo -e "  2. 然后重新运行本脚本"
-  elif $has_compile; then
-    FAIL_CATEGORY="编译"
-    echo -e "  ${BOLD}失败原因: 🔨 原生模块编译失败${NC}"
-    echo ""
-    echo -e "  ${BOLD}解决方案:${NC}"
-    if [[ "$(detect_os)" == "macOS" ]]; then
-      echo -e "  1. 安装 Xcode Command Line Tools:"
-      echo -e "     ${CYAN}xcode-select --install${NC}"
-    else
-      echo -e "  1. 安装编译工具链:"
-      echo -e "     ${CYAN}sudo apt install -y build-essential python3${NC}"
-    fi
-    echo -e "  2. 然后重新运行本脚本"
   else
     FAIL_CATEGORY="未知"
     echo -e "  ${BOLD}失败原因: ❓ 未知错误${NC}"
@@ -984,21 +1397,32 @@ phase5_verify() {
 
   # 刷新 PATH
   hash -r 2>/dev/null || true
+  ensure_npm_global_bin_on_path
+  ensure_pnpm_global_bin_on_path
 
   # 检查命令是否可用
   if ! check_command openclaw; then
     # 尝试常见路径
-    local search_paths=(
-      "$HOME/.npm-global/bin"
-      "$HOME/.local/bin"
-      "$(npm prefix -g 2>/dev/null)/bin"
-    )
+    local npm_bin=""
+    local pnpm_bin=""
+    npm_bin="$(npm_global_bin_dir)"
+    pnpm_bin="$(pnpm_global_bin_dir)"
+    local search_paths=("$HOME/.npm-global/bin" "$HOME/.local/bin")
+    [[ -n "$npm_bin" ]] && search_paths+=("$npm_bin")
+    [[ -n "$pnpm_bin" ]] && search_paths+=("$pnpm_bin")
     for p in "${search_paths[@]}"; do
       if [[ -x "$p/openclaw" ]]; then
         export PATH="$p:$PATH"
         break
       fi
     done
+  fi
+
+  if ! check_command openclaw; then
+    repair_openclaw_bin || true
+    hash -r 2>/dev/null || true
+    ensure_npm_global_bin_on_path
+    ensure_pnpm_global_bin_on_path
   fi
 
   if check_command openclaw; then
@@ -1008,10 +1432,14 @@ phase5_verify() {
   else
     log_fail "openclaw 命令不可用"
     echo ""
-    echo -e "  ${ARROW} 可能需要将 npm 全局 bin 目录加入 PATH:"
-    echo -e "    ${CYAN}export PATH=\"\$(npm prefix -g)/bin:\$PATH\"${NC}"
-    echo -e "  ${ARROW} 然后重新打开终端或运行:"
-    echo -e "    ${CYAN}source ~/.zshrc  # 或 source ~/.bashrc${NC}"
+    local shell_rc
+    shell_rc="$(preferred_shell_rc)"
+    echo -e "  ${ARROW} 脚本已自动尝试修复 npm/pnpm 的 PATH 和 openclaw bin 入口。"
+    echo -e "  ${ARROW} 现在请直接执行:"
+    echo -e "    ${CYAN}source ${shell_rc}${NC}"
+    echo -e "  ${ARROW} 然后验证:"
+    echo -e "    ${CYAN}openclaw --version${NC}"
+    echo -e "  ${ARROW} 如果还不行，再打开一个新的终端窗口。"
     return 1
   fi
 
@@ -1035,9 +1463,8 @@ show_success() {
   echo "╔══════════════════════════════════════════════════════╗"
   echo "║  🎉 安装成功！                                      ║"
   echo "║                                                      ║"
-  echo -e "║  ${YELLOW}⚠️  重要提示:                                       ${GREEN}║"
-  echo -e "║  ${YELLOW}环境变量已被修改，需要在全新的终端窗口中才能生效！${GREEN}║"
-  echo -e "║  ${YELLOW}请务必关闭当前终端，然后再重新打开一个新的终端。  ${GREEN}║"
+  echo -e "║  ${YELLOW}已自动处理 npm/pnpm PATH 持久化与安装兜底路径。     ${GREEN}║"
+  echo -e "║  ${YELLOW}如当前窗口还未识别命令，开一个新终端即可。           ${GREEN}║"
   echo "║                                                      ║"
 
   if ! $NO_ONBOARD; then
@@ -1053,7 +1480,7 @@ show_success() {
   echo "╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
-  # 动态获取安装路径进行 PATH 持久化提示
+  # 动态获取安装路径进行结果提示
   local global_bin=""
   if check_command npm; then
     local real_path
@@ -1077,12 +1504,13 @@ show_success() {
     global_bin="$HOME/.npm-global/bin"
   fi
 
+  if [[ -z "$global_bin" ]]; then
+    global_bin="$(pnpm_global_bin_dir)"
+  fi
+
   if [[ -n "$global_bin" ]]; then
-    local shell_rc="~/.zshrc"
-    [[ "$SHELL" == *bash* ]] && shell_rc="~/.bashrc"
-    echo -e "${YELLOW}提示: 环境路径需要配置到您的 shell 配置文件 (${shell_rc}) 中以持久化 PATH:${NC}"
-    echo -e "  您可以运行下面这行命令使其立即在以后每次打开的窗口生效:"
-    echo -e "  ${CYAN}echo 'export PATH=\"${global_bin}:\$PATH\"' >> ${shell_rc}${NC}"
+    echo -e "${YELLOW}已确认全局命令目录:${NC} ${CYAN}${global_bin}${NC}"
+    echo -e "${YELLOW}脚本已经自动把它写入常用 shell 配置文件。${NC}"
     echo ""
   fi
 }
